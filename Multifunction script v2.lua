@@ -922,7 +922,6 @@ local uiState = { menuOpen = false }
 
 local NOCLIP_KEY = Enum.KeyCode.N
 local CLICKER_KEY = Enum.KeyCode.K
-local BURST_KEY = Enum.KeyCode.B
 
 -- Slider-Zeile (ziehbar mit Maus/Touch)
 local function addSliderRow(page, text, minValue, maxValue, step, getValue, setValue)
@@ -1131,8 +1130,6 @@ end
 local autoClickOn = false
 local clicksPerSecond = 500
 local clickBurst = 10 -- maximale Klicks pro Frame (hoeher = schneller, aber mehr Last)
-local burstCount = 100 -- Anzahl Klicks pro Tastendruck (Burst)
-local queueClickBurst
 local clickMode = "Mouse1" -- "Mouse1" = echter Mausklick (mouse1click / VirtualInputManager), "Virtual" = VirtualUser, "Tool" = Tool:Activate()
 local updateAutoClicker
 local function setAutoClick(value)
@@ -1187,23 +1184,8 @@ do
 	local function runBatch(click, count)
 		for _ = 1, count do click() end
 	end
-	local pending = 0
-	function queueClickBurst(amount)
-		if not scriptFunctionsWorking then return end
-		if uiState.menuOpen then
-			setStatus("Close the menu first - burst clicks are skipped while it is open.")
-			return
-		end
-		pending = math.min(pending + amount, 2000)
-		setStatus("Burst: " .. tostring(amount) .. " clicks queued")
-	end
 	function updateAutoClicker(dt)
-		if not scriptFunctionsWorking or uiState.menuOpen then
-			owed = 0
-			pending = 0
-			return
-		end
-		if (not autoClickOn) and pending < 1 then
+		if not (autoClickOn and scriptFunctionsWorking) or uiState.menuOpen then
 			owed = 0
 			return
 		end
@@ -1213,34 +1195,24 @@ do
 		end
 		-- Bei sehr niedrigen FPS weniger Klicks, damit sich das Spiel erholen kann
 		local limit = (dt > LOW_FPS_DT) and LOW_FPS_MAX_CLICKS or clickBurst
-		local count = 0
-		if autoClickOn then
-			owed = math.min(owed + clicksPerSecond * dt, limit)
-			count = math.floor(owed)
-			owed -= count
-		end
-		-- Burst: pro Frame hoechstens "limit" Klicks aus der Warteschlange
-		local fromBurst = math.min(pending, limit)
-		pending -= fromBurst
-		count += fromBurst
+		owed = math.min(owed + clicksPerSecond * dt, limit)
+		local count = math.floor(owed)
 		frameCount += 1
 		statTime += dt
 		if count >= 1 then
+			owed -= count
 			if pcall(runBatch, getClicker(), count) then
 				sentCount += count
 			else
 				autoClickOn = false
 				owed = 0
-				pending = 0
 				setStatus("Auto-Clicker stopped: click method failed.")
 				refreshGui()
 			end
 		end
 		-- Live-Anzeige: wie viele Klicks wirklich gesendet wurden
 		if statTime >= 1 then
-			if autoClickOn then
-				setStatus(string.format("Auto-Clicker: %d clicks/s sent  (%d FPS)", math.floor(sentCount / statTime + 0.5), math.floor(frameCount / statTime + 0.5)))
-			end
+			setStatus(string.format("Auto-Clicker: %d clicks/s sent  (%d FPS)", math.floor(sentCount / statTime + 0.5), math.floor(frameCount / statTime + 0.5)))
 			sentCount, statTime, frameCount = 0, 0, 0
 		end
 	end
@@ -1419,6 +1391,52 @@ function refreshHud()
 end
 end
 
+-- 12) No Recoil: gleicht ungewollte Kamera-Bewegungen waehrend des Schiessens aus
+-- Funktioniert, wenn die Waffe den Rueckstoss ueber die Standard-Kamera erzeugt. Eigene Waffen-Kameras (Scriptable) koennen abweichen.
+local noRecoilOn = false
+local recoilStrength = 100 -- Prozent der Korrektur
+local updateNoRecoil
+do
+	local lastPitch, lastYaw = nil, nil
+	local moveAccum = 0        -- echte Mausbewegung seit dem letzten Frame
+	local lastShot = -math.huge
+	local SHOT_WINDOW = 0.3    -- so lange nach einem Klick gilt "Schiessen" (auch fuer Auto-Clicker)
+	connect(UserInputService.InputChanged, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement then
+			moveAccum += input.Delta.Magnitude
+		end
+	end)
+	connect(UserInputService.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then lastShot = os.clock() end
+	end)
+	local function lookAngles(look)
+		return math.asin(math.clamp(look.Y, -1, 1)), math.atan2(-look.X, -look.Z)
+	end
+	function updateNoRecoil(camera)
+		local moved = moveAccum >= 0.5
+		moveAccum = 0
+		local firing = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) or (os.clock() - lastShot) < SHOT_WINDOW
+		if not (noRecoilOn and scriptFunctionsWorking and camera and firing) or lockedTarget or uiState.menuOpen then
+			lastPitch, lastYaw = nil, nil
+			return
+		end
+		local pitch, yaw = lookAngles(camera.CFrame.LookVector)
+		-- Bewegt sich die Maus nicht, darf sich die Kamera nicht drehen: jede Drehung ist dann Rueckstoss
+		if lastPitch and not moved then
+			local dPitch = pitch - lastPitch
+			local dYaw = (yaw - lastYaw + math.pi) % (2 * math.pi) - math.pi
+			if math.abs(dPitch) > 1e-4 or math.abs(dYaw) > 1e-4 then
+				local k = recoilStrength / 100
+				local cf = camera.CFrame
+				local position = cf.Position
+				camera.CFrame = CFrame.new(position) * CFrame.Angles(0, -dYaw * k, 0) * (cf - position) * CFrame.Angles(-dPitch * k, 0, 0)
+				pitch, yaw = lookAngles(camera.CFrame.LookVector)
+			end
+		end
+		lastPitch, lastYaw = pitch, yaw
+	end
+end
+
 -- Update-Schleifen
 connect(RunService.Heartbeat, function(dt)
 	updateAutoClicker(dt)
@@ -1443,6 +1461,7 @@ RunService:BindToRenderStep("HeadLockExtras", Enum.RenderPriority.Camera.Value +
 	end
 	crosshairFrame.Visible = crosshairOn and scriptFunctionsWorking
 	updateTracers(camera)
+	updateNoRecoil(camera)
 end)
 
 -- Hotkeys fuer Noclip und Auto-Clicker
@@ -1454,8 +1473,6 @@ connect(UserInputService.InputBegan, function(input)
 		setNoclip(not noclipOn)
 	elseif input.KeyCode == CLICKER_KEY then
 		setAutoClick(not autoClickOn)
-	elseif input.KeyCode == BURST_KEY then
-		queueClickBurst(burstCount)
 	end
 end)
 
@@ -1464,6 +1481,7 @@ local function resetExtras()
 	scriptAlive = false
 	fovEnabled, hitboxResize, speedOn, jumpOn = false, false, false, false
 	noclipOn, autoClickOn, tracersOn, crosshairOn, hudOn = false, false, false, false, false
+	noRecoilOn = false
 	restoreAllHitboxes()
 	updateHumanoidMods()
 	restoreNoclip()
@@ -1508,11 +1526,12 @@ local function collectConfig()
 		tracersOn = tracersOn,
 		tracerThickness = tracerThickness,
 		noclipOn = noclipOn,
+		noRecoil = noRecoilOn,
+		recoilStrength = recoilStrength,
 		hudOn = hudOn,
 		autoClickOn = autoClickOn,
 		clicksPerSecond = clicksPerSecond,
 		clickBurst = clickBurst,
-		burstCount = burstCount,
 		clickMode = clickMode,
 		keys = {
 			aimbot = TOGGLE_KEY.Name,
@@ -1521,7 +1540,6 @@ local function collectConfig()
 			pause = SCRIPT_PAUSE_KEY.Name,
 			noclip = NOCLIP_KEY.Name,
 			clicker = CLICKER_KEY.Name,
-			burst = BURST_KEY.Name,
 		},
 	}
 end
@@ -1603,7 +1621,6 @@ function loadConfig()
 	hudOn = pickBool(data.hudOn, hudOn)
 	clicksPerSecond = pickNumber(data.clicksPerSecond, clicksPerSecond, 1, 500)
 	clickBurst = pickNumber(data.clickBurst, clickBurst, 1, 50)
-	burstCount = math.floor(pickNumber(data.burstCount, burstCount, 1, 500))
 	clickMode = pickChoice(data.clickMode, { "Mouse1", "Virtual", "Tool" }, clickMode)
 	if type(data.keys) == "table" then
 		TOGGLE_KEY = pickKey(data.keys.aimbot, TOGGLE_KEY)
@@ -1612,10 +1629,11 @@ function loadConfig()
 		SCRIPT_PAUSE_KEY = pickKey(data.keys.pause, SCRIPT_PAUSE_KEY)
 		NOCLIP_KEY = pickKey(data.keys.noclip, NOCLIP_KEY)
 		CLICKER_KEY = pickKey(data.keys.clicker, CLICKER_KEY)
-		BURST_KEY = pickKey(data.keys.burst, BURST_KEY)
 	end
 	setEnabled(pickBool(data.aimbot, isEnabled))
 	setPixelHitboxLocal(pickBool(data.pixelHitbox, pixelHitboxOn))
+	noRecoilOn = pickBool(data.noRecoil, noRecoilOn)
+	recoilStrength = pickNumber(data.recoilStrength, recoilStrength, 10, 100)
 	setNoclip(pickBool(data.noclipOn, noclipOn))
 	setAutoClick(pickBool(data.autoClickOn, autoClickOn))
 	applyCrosshair()
@@ -1658,11 +1676,13 @@ addSection(combatPage, "Hitbox")
 addToggleRow(combatPage, "Hitbox resizer  (enemies)", function() return hitboxResize end, function(value) hitboxResize = value end)
 addSliderRow(combatPage, "Hitbox size", 2, 30, 1, function() return hitboxScale end, function(value) hitboxScale = value end)
 addToggleRow(combatPage, "Pixel Hitbox  (own character)", function() return pixelHitboxOn end, function(value) setPixelHitboxLocal(value) end)
+addSection(combatPage, "Weapon")
+addToggleRow(combatPage, "No recoil", function() return noRecoilOn end, function(value) noRecoilOn = value end)
+addSliderRow(combatPage, "Recoil reduction (%)", 10, 100, 5, function() return recoilStrength end, function(value) recoilStrength = value end)
 addSection(combatPage, "Auto-Clicker")
 addToggleRow(combatPage, function() return "Auto-Clicker  (" .. CLICKER_KEY.Name .. ")" end, function() return autoClickOn end, function(value) setAutoClick(value) end)
 addSliderRow(combatPage, "Clicks/s  (high = laggy)", 1, 500, 1, function() return clicksPerSecond end, function(value) clicksPerSecond = value end)
 addSliderRow(combatPage, "Max clicks per frame", 1, 50, 1, function() return clickBurst end, function(value) clickBurst = value end)
-addSliderRow(combatPage, function() return "Burst size  (press " .. BURST_KEY.Name .. ")" end, 1, 500, 1, function() return burstCount end, function(value) burstCount = value end)
 addCycleRow(combatPage, "Click mode", function() return clickMode end, function()
 	if clickMode == "Mouse1" then clickMode = "Virtual" elseif clickMode == "Virtual" then clickMode = "Tool" else clickMode = "Mouse1" end
 end)
@@ -1941,7 +1961,6 @@ local hotkeys = {
 { name = "Pause functions", get = function() return SCRIPT_PAUSE_KEY end, set = function(k) SCRIPT_PAUSE_KEY = k end },
 { name = "Noclip toggle", get = function() return NOCLIP_KEY end, set = function(k) NOCLIP_KEY = k end },
 { name = "Auto-Clicker toggle", get = function() return CLICKER_KEY end, set = function(k) CLICKER_KEY = k end },
-{ name = "Click burst", get = function() return BURST_KEY end, set = function(k) BURST_KEY = k end },
 }
 addSection(settingsPage, "Hotkeys")
 for _, entry in ipairs(hotkeys) do
@@ -1979,7 +1998,6 @@ MENU_KEY = Enum.KeyCode.RightShift
 SCRIPT_PAUSE_KEY = Enum.KeyCode.P
 NOCLIP_KEY = Enum.KeyCode.N
 CLICKER_KEY = Enum.KeyCode.K
-BURST_KEY = Enum.KeyCode.B
 setStatus("Hotkeys reset to default.")
 refreshGui()
 updatePanel()
